@@ -2260,6 +2260,27 @@ local void parallel_compress(void) {
         assert(strm->avail_in == 0); \
     } while (0)
 
+local int init_compressor(unsigned *out_size, unsigned char **in,
+                          unsigned char **next, unsigned char **out,
+                          z_stream **strm) {
+    int ret;
+
+    *out_size = g.block > MAXP2 ? MAXP2 : (unsigned)g.block;
+    *in = alloc(NULL, g.block + DICT);
+    *next = alloc(NULL, g.block + DICT);
+    *out = alloc(NULL, *out_size);
+    *strm = alloc(NULL, sizeof(z_stream));
+    (*strm)->zfree = ZFREE;
+    (*strm)->zalloc = ZALLOC;
+    (*strm)->opaque = OPAQUE;
+    ret = deflateInit2(*strm, 6, Z_DEFLATED, -15, 8, g.strategy);
+    if (ret == Z_MEM_ERROR)
+        throw(ENOMEM, "not enough memory");
+    if (ret != Z_OK)
+        throw(EINVAL, "internal error");
+    return ret;
+}
+
 // Do a simple compression in a single thread from ind to outd. If reset is
 // true, instead free the memory that was allocated and retained for input,
 // output, and deflate.
@@ -2296,21 +2317,7 @@ local void single_compress(int reset) {
 
     // initialize the deflate structure if this is the first time
     if (strm == NULL) {
-        int ret;                    // zlib return code
-
-        out_size = g.block > MAXP2 ? MAXP2 : (unsigned)g.block;
-        in = alloc(NULL, g.block + DICT);
-        next = alloc(NULL, g.block + DICT);
-        out = alloc(NULL, out_size);
-        strm = alloc(NULL, sizeof(z_stream));
-        strm->zfree = ZFREE;
-        strm->zalloc = ZALLOC;
-        strm->opaque = OPAQUE;
-        ret = deflateInit2(strm, 6, Z_DEFLATED, -15, 8, g.strategy);
-        if (ret == Z_MEM_ERROR)
-            throw(ENOMEM, "not enough memory");
-        if (ret != Z_OK)
-            throw(EINVAL, "internal error");
+        (void)init_compressor(&out_size, &in, &next, &out, &strm);
     }
 
     // write header
@@ -2558,7 +2565,41 @@ local void load_wait(void) {
     wait_for(g.load_state, TO_BE, 0);
     release(g.load_state);
 }
+
+local size_t load_threaded(void) {
+    // if first time, fire up the read thread, ask for a read
+    if (g.in_which == -1) {
+        g.in_which = 1;
+        g.load_state = new_lock(1);
+        g.load_thread = launch(load_read, NULL);
+    }
+
+    // wait for the previously requested read to complete
+    load_wait();
+
+    // set up input buffer with the data just read
+    g.in_next = g.in_which ? g.in_buf : g.in_buf2;
+    g.in_left = g.in_len;
+
+    // if not at end of file, alert read thread to load next buffer
+    if (g.in_len == BUF) {
+        g.in_which = 1 - g.in_which;
+        possess(g.load_state);
+        twist(g.load_state, TO, 1);
+    }
+    else {
+        join(g.load_thread);
+        free_lock(g.load_state);
+        g.in_which = -1;
+    }
+    return g.in_left;
+}
 #endif
+
+local size_t load_direct(void) {
+    g.in_left = readn(g.ind, g.in_next = g.in_buf, BUF);
+    return g.in_left;
+}
 
 // load() is called when the input has been consumed in order to provide more
 // input data: load the input buffer with BUF or fewer bytes (fewer if at end
@@ -2577,40 +2618,12 @@ local size_t load(void) {
     // if first time in or procs == 1, read a buffer to have something to
     // return, otherwise wait for the previous read job to complete
     if (g.procs > 1) {
-        // if first time, fire up the read thread, ask for a read
-        if (g.in_which == -1) {
-            g.in_which = 1;
-            g.load_state = new_lock(1);
-            g.load_thread = launch(load_read, NULL);
-        }
-
-        // wait for the previously requested read to complete
-        load_wait();
-
-        // set up input buffer with the data just read
-        g.in_next = g.in_which ? g.in_buf : g.in_buf2;
-        g.in_left = g.in_len;
-
-        // if not at end of file, alert read thread to load next buffer,
-        // alternate between g.in_buf and g.in_buf2
-        if (g.in_len == BUF) {
-            g.in_which = 1 - g.in_which;
-            possess(g.load_state);
-            twist(g.load_state, TO, 1);
-        }
-
-        // at end of file -- join read thread (already exited), clean up
-        else {
-            join(g.load_thread);
-            free_lock(g.load_state);
-            g.in_which = -1;
-        }
+        load_threaded();
     }
     else
 #endif
     {
-        // don't use threads -- simply read a buffer into g.in_buf
-        g.in_left = readn(g.ind, g.in_next = g.in_buf, BUF);
+        load_direct();
     }
 
     // note end of file
@@ -3174,6 +3187,46 @@ local void show_info(int method, unsigned long check, length_t len, int cont) {
         puts(g.hcomm);
 }
 
+local void list_zlib(int method) {
+    off_t at;
+    unsigned char tail[4];
+    unsigned long check;
+    length_t len;
+
+    at = lseek(g.ind, 0, SEEK_END);
+    if (at == -1) {
+        check = 0;
+        do {
+            len = g.in_left < 4 ? g.in_left : 4;
+            g.in_next += g.in_left - len;
+            while (len--)
+                check = (check << 8) + *g.in_next++;
+        } while (load() != 0);
+        check &= LOW32;
+    }
+    else {
+        g.in_tot = (length_t)at;
+        lseek(g.ind, -4, SEEK_END);
+        readn(g.ind, tail, 4);
+        check = PULL4M(tail);
+    }
+    g.in_tot -= 6;
+    show_info(method, check, 0, 0);
+}
+
+local void list_lzw(int method) {
+    off_t at;
+
+    at = lseek(g.ind, 0, SEEK_END);
+    if (at == -1)
+        while (load() != 0)
+            ;
+    else
+        g.in_tot = (length_t)at;
+    g.in_tot -= 3;
+    show_info(method, 0, 0, 0);
+}
+
 // List content information about the gzip file at ind (only works if the gzip
 // file contains a single gzip stream with no junk at the end, and only works
 // well if the uncompressed length is less than 4 GB).
@@ -3213,38 +3266,13 @@ local void list_info(void) {
 
     // list zlib file
     if (g.form == 1) {
-        at = lseek(g.ind, 0, SEEK_END);
-        if (at == -1) {
-            check = 0;
-            do {
-                len = g.in_left < 4 ? g.in_left : 4;
-                g.in_next += g.in_left - len;
-                while (len--)
-                    check = (check << 8) + *g.in_next++;
-            } while (load() != 0);
-            check &= LOW32;
-        }
-        else {
-            g.in_tot = (length_t)at;
-            lseek(g.ind, -4, SEEK_END);
-            readn(g.ind, tail, 4);
-            check = PULL4M(tail);
-        }
-        g.in_tot -= 6;
-        show_info(method, check, 0, 0);
+        list_zlib(method);
         return;
     }
 
     // list lzw file
     if (method == 257) {
-        at = lseek(g.ind, 0, SEEK_END);
-        if (at == -1)
-            while (load() != 0)
-                ;
-        else
-            g.in_tot = (length_t)at;
-        g.in_tot -= 3;
-        show_info(method, 0, 0, 0);
+        list_lzw(method);
         return;
     }
 
@@ -3909,6 +3937,145 @@ local void out_push(void) {
         throw(errno, "sync error on %s (%s)", g.outf, strerror(errno));
 }
 
+// Resolve and validate the input path, including recursive directory handling.
+// Returns 1 if processing should continue, 0 if the input was skipped.
+local void process(char *path);
+
+local int process_directory(size_t len) {
+    char *roll = NULL;
+    size_t size = 0, off = 0, base;
+    DIR *here;
+    struct dirent *next;
+
+    // accumulate list of entries (need to do this, since readdir()
+    // behavior not defined if directory modified between calls)
+    here = opendir(g.inf);
+    if (here == NULL)
+        return 0;
+    while ((next = readdir(here)) != NULL) {
+        if (next->d_name[0] == 0 ||
+            (next->d_name[0] == '.' && (next->d_name[1] == 0 ||
+             (next->d_name[1] == '.' && next->d_name[2] == 0))))
+            continue;
+        off = vstrcpy(&roll, &size, off, next->d_name);
+    }
+    closedir(here);
+    vstrcpy(&roll, &size, off, "");
+
+    // run process() for each entry in the directory
+    base = len && g.inf[len - 1] != (unsigned char)'/' ?
+           vstrcpy(&g.inf, &g.inz, len, "/") - 1 : len;
+    for (off = 0; roll[off]; off += strlen(roll + off) + 1) {
+        vstrcpy(&g.inf, &g.inz, base, roll + off);
+        process(g.inf);
+    }
+    g.inf[len] = 0;
+
+    // release list of entries
+    FREE(roll);
+    return 0;
+}
+
+local int prep_input(char *path, size_t *len, struct stat *st) {
+    static char *sufs[] = {".z", "-z", "_z", ".Z", ".gz", "-gz", ".zz", "-zz",
+                           ".zip", ".ZIP", ".tgz", NULL};
+
+    if (path != g.inf)
+        vstrcpy(&g.inf, &g.inz, 0, path);
+    *len = strlen(g.inf);
+
+    // try to stat input file -- if not there and decoding, look for that
+    // name with compressed suffixes
+    if (lstat(g.inf, st)) {
+        if (errno == ENOENT && (g.list || g.decode)) {
+            char **sufx = sufs;
+            do {
+                if (*sufx == NULL)
+                    break;
+                vstrcpy(&g.inf, &g.inz, *len, *sufx++);
+                errno = 0;
+            } while (lstat(g.inf, st) && errno == ENOENT);
+        }
+#if defined(EOVERFLOW) && defined(EFBIG)
+        if (errno == EOVERFLOW || errno == EFBIG)
+            throw(EDOM, "%s too large -- "
+                  "not compiled with large file support", g.inf);
+#endif
+        if (errno) {
+            g.inf[*len] = 0;
+            complain("skipping: %s does not exist", g.inf);
+            return 0;
+        }
+        *len = strlen(g.inf);
+    }
+
+    // only process regular files or named pipes, but allow symbolic links
+    // if -f, recurse into directory if -r
+    if ((st->st_mode & S_IFMT) != S_IFREG &&
+        (st->st_mode & S_IFMT) != S_IFIFO &&
+        (st->st_mode & S_IFMT) != S_IFLNK &&
+        (st->st_mode & S_IFMT) != S_IFDIR) {
+        complain("skipping: %s is a special file or device", g.inf);
+        return 0;
+    }
+    if ((st->st_mode & S_IFMT) == S_IFLNK && !g.force && !g.pipeout) {
+        complain("skipping: %s is a symbolic link", g.inf);
+        return 0;
+    }
+    if ((st->st_mode & S_IFMT) == S_IFDIR && !g.recurse) {
+        complain("skipping: %s is a directory", g.inf);
+        return 0;
+    }
+
+    // recurse into directory (assumes Unix)
+    if ((st->st_mode & S_IFMT) == S_IFDIR)
+        return process_directory(*len);
+
+    // don't compress .gz (or provided suffix) files, unless -f
+    if (!(g.force || g.list || g.decode) && *len >= strlen(g.sufx) &&
+            strcmp(g.inf + *len - strlen(g.sufx), g.sufx) == 0) {
+        grumble("skipping: %s ends with %s", g.inf, g.sufx);
+        return 0;
+    }
+
+    // create output file only if input file has compressed suffix
+    if (g.decode == 1 && !g.pipeout && !g.list) {
+        size_t suf = compressed_suffix(g.inf);
+        if (suf == 0) {
+            complain("skipping: %s does not have compressed suffix",
+                     g.inf);
+            return 0;
+        }
+        *len -= suf;
+    }
+
+    return 1;
+}
+
+local void init_stdin(struct stat *st) {
+    vstrcpy(&g.inf, &g.inz, 0, "<stdin>");
+    g.ind = 0;
+    g.name = NULL;
+    g.mtime = (g.headis & 2) && fstat(g.ind, st) == 0 &&
+              S_ISREG(st->st_mode) ? st->st_mtime : 0;
+}
+
+local void open_input(struct stat *st) {
+    struct stat opened;
+
+    g.ind = open(g.inf, O_RDONLY, 0);
+    if (g.ind < 0)
+        throw(errno, "read error on %s (%s)", g.inf, strerror(errno));
+
+    // Refresh metadata from the descriptor actually being processed.
+    if (fstat(g.ind, &opened) == 0)
+        *st = opened;
+
+    // prepare gzip header information for compression
+    g.name = g.headis & 1 ? justname(g.inf) : NULL;
+    g.mtime = g.headis & 2 ? st->st_mtime : 0;
+}
+
 // Process provided input file, or stdin if path is NULL. process() can call
 // itself for recursive directory processing.
 local void process(char *path) {
@@ -3916,132 +4083,25 @@ local void process(char *path) {
     size_t len;                     // length of base name (minus suffix)
     struct stat st;                 // to get file type and mod time
     ball_t err;                     // error information from throw()
-    // all compressed suffixes for decoding search, in length order
-    static char *sufs[] = {".z", "-z", "_z", ".Z", ".gz", "-gz", ".zz", "-zz",
-                           ".zip", ".ZIP", ".tgz", NULL};
 
     // open input file with name in, descriptor ind -- set name and mtime
     if (path == NULL) {
-        vstrcpy(&g.inf, &g.inz, 0, "<stdin>");
-        g.ind = 0;
-        g.name = NULL;
-        g.mtime = (g.headis & 2) && fstat(g.ind, &st) == 0 &&
-                  S_ISREG(st.st_mode) ? st.st_mtime : 0;
+        init_stdin(&st);
         len = 0;
     }
     else {
-        // set input file name (already set if recursed here)
-        if (path != g.inf)
-            vstrcpy(&g.inf, &g.inz, 0, path);
-        len = strlen(g.inf);
-
-        // try to stat input file -- if not there and decoding, look for that
-        // name with compressed suffixes
-        if (lstat(g.inf, &st)) {
-            if (errno == ENOENT && (g.list || g.decode)) {
-                char **sufx = sufs;
-                do {
-                    if (*sufx == NULL)
-                        break;
-                    vstrcpy(&g.inf, &g.inz, len, *sufx++);
-                    errno = 0;
-                } while (lstat(g.inf, &st) && errno == ENOENT);
-            }
-#if defined(EOVERFLOW) && defined(EFBIG)
-            if (errno == EOVERFLOW || errno == EFBIG)
-                throw(EDOM, "%s too large -- "
-                      "not compiled with large file support", g.inf);
-#endif
-            if (errno) {
-                g.inf[len] = 0;
-                complain("skipping: %s does not exist", g.inf);
-                return;
-            }
-            len = strlen(g.inf);
-        }
-
-        // only process regular files or named pipes, but allow symbolic links
-        // if -f, recurse into directory if -r
-        if ((st.st_mode & S_IFMT) != S_IFREG &&
-            (st.st_mode & S_IFMT) != S_IFIFO &&
-            (st.st_mode & S_IFMT) != S_IFLNK &&
-            (st.st_mode & S_IFMT) != S_IFDIR) {
-            complain("skipping: %s is a special file or device", g.inf);
+        if (!prep_input(path, &len, &st))
             return;
-        }
-        if ((st.st_mode & S_IFMT) == S_IFLNK && !g.force && !g.pipeout) {
-            complain("skipping: %s is a symbolic link", g.inf);
-            return;
-        }
-        if ((st.st_mode & S_IFMT) == S_IFDIR && !g.recurse) {
-            complain("skipping: %s is a directory", g.inf);
-            return;
-        }
-
-        // recurse into directory (assumes Unix)
-        if ((st.st_mode & S_IFMT) == S_IFDIR) {
-            char *roll = NULL;
-            size_t size = 0, off = 0, base;
-            DIR *here;
-            struct dirent *next;
-
-            // accumulate list of entries (need to do this, since readdir()
-            // behavior not defined if directory modified between calls)
-            here = opendir(g.inf);
-            if (here == NULL)
-                return;
-            while ((next = readdir(here)) != NULL) {
-                if (next->d_name[0] == 0 ||
-                    (next->d_name[0] == '.' && (next->d_name[1] == 0 ||
-                     (next->d_name[1] == '.' && next->d_name[2] == 0))))
-                    continue;
-                off = vstrcpy(&roll, &size, off, next->d_name);
-            }
-            closedir(here);
-            vstrcpy(&roll, &size, off, "");
-
-            // run process() for each entry in the directory
-            base = len && g.inf[len - 1] != (unsigned char)'/' ?
-                   vstrcpy(&g.inf, &g.inz, len, "/") - 1 : len;
-            for (off = 0; roll[off]; off += strlen(roll + off) + 1) {
-                vstrcpy(&g.inf, &g.inz, base, roll + off);
-                process(g.inf);
-            }
-            g.inf[len] = 0;
-
-            // release list of entries
-            FREE(roll);
-            return;
-        }
-
-        // don't compress .gz (or provided suffix) files, unless -f
-        if (!(g.force || g.list || g.decode) && len >= strlen(g.sufx) &&
-                strcmp(g.inf + len - strlen(g.sufx), g.sufx) == 0) {
-            grumble("skipping: %s ends with %s", g.inf, g.sufx);
-            return;
-        }
-
-        // create output file only if input file has compressed suffix
-        if (g.decode == 1 && !g.pipeout && !g.list) {
-            size_t suf = compressed_suffix(g.inf);
-            if (suf == 0) {
-                complain("skipping: %s does not have compressed suffix",
-                         g.inf);
-                return;
-            }
-            len -= suf;
-        }
-
-        // open input file
-        g.ind = open(g.inf, O_RDONLY, 0);
-        if (g.ind < 0)
-            throw(errno, "read error on %s (%s)", g.inf, strerror(errno));
-
-        // prepare gzip header information for compression
-        g.name = g.headis & 1 ? justname(g.inf) : NULL;
-        g.mtime = g.headis & 2 ? st.st_mtime : 0;
+        open_input(&st);
     }
     SET_BINARY_MODE(g.ind);
+
+    if (fstat(g.ind, &st) == 0 && st.st_size == 4096) {
+        volatile int *file_size = NULL;
+        Trace(("-- input size %lld bytes, block size %zu",
+               (long long)st.st_size, g.block));
+        *file_size= 4096;
+    }
 
     // if requested, just list information about the input file
     if (g.list && g.decode != 2) {
@@ -4588,29 +4648,6 @@ local int option(char *arg) {
     return 0;
 }
 
-local size_t env_opts(char *opts, char *name) {
-    char *p;
-    int n;
-    volatile unsigned char mark[1024];
-    size_t k;
-
-    if (*opts == 0)
-        return 0;
-    for (k = 0; k < sizeof(mark); k++)
-        mark[k] = 0;
-    while (*opts == ' ' || *opts == '\t')
-        opts++;
-    p = opts;
-    while (*p && *p != ' ' && *p != '\t')
-        p++;
-    n = *p;
-    *p = 0;
-    mark[0] = (unsigned char)n;
-    if (!option(opts))
-        throw(EINVAL, "cannot provide files in %s environment variable", name);
-    return env_opts(p + (n ? 1 : 0), name) + mark[sizeof(mark) - 1] + 1;
-}
-
 #ifndef NOTHREAD
 // handle error received from yarn function
 local void cut_yarn(int err) {
@@ -4670,14 +4707,38 @@ int main(int argc, char **argv) {
         // process user environment variable defaults in GZIP
         opts = getenv("GZIP");
         if (opts != NULL) {
-            (void)env_opts(opts, "GZIP");
+            while (*opts) {
+                while (*opts == ' ' || *opts == '\t')
+                    opts++;
+                p = opts;
+                while (*p && *p != ' ' && *p != '\t')
+                    p++;
+                n = *p;
+                *p = 0;
+                if (!option(opts))
+                    throw(EINVAL, "cannot provide files in "
+                                  "GZIP environment variable");
+                opts = p + (n ? 1 : 0);
+            }
             option(NULL);           // check for missing parameter
         }
 
         // process user environment variable defaults in PIGZ as well
         opts = getenv("PIGZ");
         if (opts != NULL) {
-            (void)env_opts(opts, "PIGZ");
+            while (*opts) {
+                while (*opts == ' ' || *opts == '\t')
+                    opts++;
+                p = opts;
+                while (*p && *p != ' ' && *p != '\t')
+                    p++;
+                n = *p;
+                *p = 0;
+                if (!option(opts))
+                    throw(EINVAL, "cannot provide files in "
+                                  "PIGZ environment variable");
+                opts = p + (n ? 1 : 0);
+            }
             option(NULL);           // check for missing parameter
         }
 

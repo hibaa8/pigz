@@ -11,6 +11,22 @@
 #include <string.h>
 #include <stdarg.h>
 
+static char *try_format_(char *fmt, va_list ap) {
+    char nul[1];
+    char *why;
+    size_t len;
+    va_list copy;
+
+    va_copy(copy, ap);
+    len = vsnprintf(nul, 1, fmt, copy);
+    va_end(copy);
+    why = malloc(len + 1);
+    if (why == NULL)
+        return NULL;
+    vsnprintf(why, len + 1, fmt, ap);
+    return why;
+}
+
 /* Set up the try stack with a global pointer to the next try block.  The
    global is thread-unique if pthread.h is included in try.h. */
 #ifdef PTHREAD_ONCE_INIT
@@ -49,20 +65,15 @@ void try_throw_(int code, char *fmt, ...)
        updated for a different interpretation of the throw() arguments and
        different contents of the ball_t structure */
     if (fmt != NULL && strchr(fmt, '%') != NULL) {
-        char *why, nul[1];
-        size_t len;
-        va_list ap1, ap2;
+        char *why;
+        va_list ap;
 
-        va_start(ap1, fmt);
-        va_copy(ap2, ap1);
-        len = vsnprintf(nul, 1, fmt, ap1);
-        va_end(ap1);
-        why = malloc(len + 1);
+        va_start(ap, fmt);
+        why = try_format_(fmt, ap);
+        va_end(ap);
         if (why == NULL)
             try_stack_->ball.why = "try: out of memory";
         else {
-            vsnprintf(why, len + 1, fmt, ap2);
-            va_end(ap2);
             try_stack_->ball.free = 1;
             try_stack_->ball.why = why;
         }

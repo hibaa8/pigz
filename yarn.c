@@ -161,36 +161,22 @@ void twist_(lock *bolt, enum twist_op op, long val,
 
 #define until(a) while(!(a))
 
+local int wait_condition(long value, enum wait_op op, long target) {
+    switch (op) {
+        case TO_BE:             return value == target;
+        case NOT_TO_BE:         return value != target;
+        case TO_BE_MORE_THAN:   return value > target;
+        case TO_BE_LESS_THAN:   return value < target;
+    }
+    return 0;
+}
+
 void wait_for_(lock *bolt, enum wait_op op, long val,
                char const *file, long line) {
-    switch (op) {
-        case TO_BE:
-            until (bolt->value == val) {
-                int ret = pthread_cond_wait(&(bolt->cond), &(bolt->mutex));
-                if (ret)
-                    fail(ret, file, line, "cond_wait");
-            }
-            break;
-        case NOT_TO_BE:
-            until (bolt->value != val) {
-                int ret = pthread_cond_wait(&(bolt->cond), &(bolt->mutex));
-                if (ret)
-                    fail(ret, file, line, "cond_wait");
-            }
-            break;
-        case TO_BE_MORE_THAN:
-            until (bolt->value > val) {
-                int ret = pthread_cond_wait(&(bolt->cond), &(bolt->mutex));
-                if (ret)
-                    fail(ret, file, line, "cond_wait");
-            }
-            break;
-        case TO_BE_LESS_THAN:
-            until (bolt->value < val) {
-                int ret = pthread_cond_wait(&(bolt->cond), &(bolt->mutex));
-                if (ret)
-                    fail(ret, file, line, "cond_wait");
-            }
+    until (wait_condition(bolt->value, op, val)) {
+        int ret = pthread_cond_wait(&(bolt->cond), &(bolt->mutex));
+        if (ret)
+            fail(ret, file, line, "cond_wait");
     }
 }
 
@@ -235,6 +221,13 @@ struct capsule {
     long line;
 };
 
+local thread *find_thread(pthread_t id) {
+    thread *match = threads;
+    while (match != NULL && !pthread_equal(match->id, id))
+        match = match->next;
+    return match;
+}
+
 // Mark the calling thread as done and alert join_all().
 local void reenter(void *arg) {
     struct capsule *capsule = arg;
@@ -243,14 +236,11 @@ local void reenter(void *arg) {
     pthread_t me = pthread_self();
     possess_(&(threads_lock), capsule->file, capsule->line);
     thread **prior = &(threads);
-    thread *match;
-    while ((match = *prior) != NULL) {
-        if (pthread_equal(match->id, me))
-            break;
-        prior = &(match->next);
-    }
+    thread *match = find_thread(me);
     if (match == NULL)
         fail(ESRCH, capsule->file, capsule->line, "reenter lost");
+    while (*prior != match)
+        prior = &((*prior)->next);
 
     // mark this thread as done and move it to the head of the list
     match->done = 1;
@@ -339,11 +329,10 @@ void join_(thread *ally, char const *file, long line) {
     // find the thread in the threads list
     possess_(&(threads_lock), file, line);
     thread **prior = &(threads);
-    thread *match;
-    while ((match = *prior) != NULL) {
-        if (match == ally)
-            break;
+    thread *match = threads;
+    while (match != NULL && match != ally) {
         prior = &(match->next);
+        match = match->next;
     }
     if (match == NULL)
         fail(ESRCH, file, line, "join lost");
